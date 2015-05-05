@@ -21,10 +21,8 @@ import org.apache.hadoop.util.bloom.Key;
 import org.apache.hadoop.util.hash.Hash;
 import org.apache.log4j.Logger;
 import org.wso2.siddhi.core.event.ComplexEventChunk;
-import org.wso2.siddhi.core.event.stream.MetaStreamEvent;
 import org.wso2.siddhi.core.event.stream.StreamEvent;
-import org.wso2.siddhi.core.event.stream.StreamEventCloner;
-import org.wso2.siddhi.core.event.stream.StreamEventPool;
+import org.wso2.siddhi.core.exception.ExecutionPlanRuntimeException;
 import org.wso2.siddhi.extension.eventtable.cache.CachingTable;
 import org.wso2.siddhi.query.api.definition.Attribute;
 import org.wso2.siddhi.query.api.definition.TableDefinition;
@@ -35,23 +33,25 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-public class DBConfiguration {
+/**
+ * Class which act as layer between the database and Siddhi. This class performs all the RDBMS related operations & Blooms Filter
+ */
+public class DBHandler {
 
     private String tableName;
     private Map<String, String> elementMappings;
-    private final ExecutionInfo executionInfo;
+    private ExecutionInfo executionInfo;
     private List<Attribute> attributeList;
     private DataSource dataSource;
     private CountingBloomFilter[] bloomFilters;
     private boolean isBloomFilterEnabled;
     private TableDefinition tableDefinition;
-    private StreamEventCloner streamEventCloner;
     private int bloomFilterSize;
     private int bloomFilterHashFunction;
-    private static final Logger log = Logger.getLogger(DBConfiguration.class);
+    private static final Logger log = Logger.getLogger(DBHandler.class);
 
 
-    public DBConfiguration(DataSource dataSource, String tableName, List<Attribute> attributeList, TableDefinition tableDefinition) {
+    public DBHandler(DataSource dataSource, String tableName, List<Attribute> attributeList, TableDefinition tableDefinition) {
 
         Connection con = null;
         this.dataSource = dataSource;
@@ -60,30 +60,23 @@ public class DBConfiguration {
         this.tableDefinition = tableDefinition;
         executionInfo = new ExecutionInfo();
 
-        MetaStreamEvent metaStreamEvent = new MetaStreamEvent();
-        metaStreamEvent.addInputDefinition(tableDefinition);
-        for (Attribute attribute : tableDefinition.getAttributeList()) {
-            metaStreamEvent.addOutputData(attribute);
-        }
-
-        StreamEventPool streamEventPool = new StreamEventPool(metaStreamEvent, 10);
-        streamEventCloner = new StreamEventCloner(metaStreamEvent, streamEventPool);
-
         try {
             con = dataSource.getConnection();
-            initializeDatabaseExecutionInfo();
+            initializeDatabaseExecutionInfo(executionInfo);
             initializeConnection();
 
 
         } catch (SQLException e) {
-            log.error("Error while initialising the connection ", e);
+            throw new ExecutionPlanRuntimeException("Error while initialising the connection ", e);
         } finally {
             cleanUpConnections(null, con);
         }
 
     }
 
-    public ExecutionInfo getExecutionInfo() {
+    public ExecutionInfo getExecutionInfoInstance() {
+        ExecutionInfo executionInfo = new ExecutionInfo();
+        initializeDatabaseExecutionInfo(executionInfo);
         return executionInfo;
     }
 
@@ -132,15 +125,14 @@ public class DBConfiguration {
                 stmt.executeUpdate();
                 con.commit();
 
-                if (isBloomFilterEnabled) {
-                    StreamEvent clonedEvent = streamEventCloner.copyStreamEvent(streamEvent);
-                    bloomFilterInsertionList.add(clonedEvent);
+                if (isBloomFilterEnabled && bloomFilterInsertionList != null) {
+                    bloomFilterInsertionList.add(streamEvent);
                 }
                 if (cachingTable != null) {
                     cachingTable.add(streamEvent);
                 }
             } catch (SQLException e) {
-                log.error("Error while adding events to event table", e);
+                throw new ExecutionPlanRuntimeException("Error while adding events to event table", e);
             } finally {
                 cleanUpConnections(stmt, con);
             }
@@ -152,12 +144,7 @@ public class DBConfiguration {
     }
 
 
-    public void deleteEvent(Object[] obj, StreamEvent streamEvent) {
-
-        ArrayList<StreamEvent> bloomFilterDeletionList = null;
-        if (isBloomFilterEnabled) {
-            bloomFilterDeletionList = new ArrayList<StreamEvent>();
-        }
+    public void deleteEvent(Object[] obj, StreamEvent streamEvent, ExecutionInfo executionInfo) {
 
         PreparedStatement stmt = null;
         Connection con = null;
@@ -174,22 +161,17 @@ public class DBConfiguration {
             }
 
             if (isBloomFilterEnabled && deletedRows > 0) {
-                StreamEvent clonedEvent = streamEventCloner.copyStreamEvent(streamEvent);
-                bloomFilterDeletionList.add(clonedEvent);
+                removeFromBloomFilters(streamEvent);
             }
 
         } catch (SQLException e) {
-            log.error("Error while deleting the event", e);
+            throw new ExecutionPlanRuntimeException("Error while deleting the event", e);
         } finally {
             cleanUpConnections(stmt, con);
         }
-
-        if (isBloomFilterEnabled) {
-            removeFromBloomFilters(bloomFilterDeletionList);
-        }
     }
 
-    public void updateEvent(Object[] obj) {
+    public void updateEvent(Object[] obj, ExecutionInfo executionInfo) {
 
         PreparedStatement stmt = null;
         Connection con = null;
@@ -203,10 +185,10 @@ public class DBConfiguration {
             updatedRows = stmt.executeUpdate();
             con.commit();
             if (log.isDebugEnabled()) {
-                log.debug(updatedRows + " updated deleted in table " + tableName);
+                log.debug(updatedRows + " updated in table " + tableName);
             }
         } catch (SQLException e) {
-            log.error("Error while updating the event", e);
+            throw new ExecutionPlanRuntimeException("Error while updating the event", e);
         } finally {
             cleanUpConnections(stmt, con);
         }
@@ -216,7 +198,7 @@ public class DBConfiguration {
         }
     }
 
-    public StreamEvent selectEvent(Object[] obj) {
+    public StreamEvent selectEvent(Object[] obj, ExecutionInfo executionInfo) {
 
         PreparedStatement stmt = null;
         Connection con = null;
@@ -260,14 +242,14 @@ public class DBConfiguration {
             }
 
         } catch (SQLException e) {
-            log.error("Error while retrieving events from event table", e);
+            throw new ExecutionPlanRuntimeException("Error while retrieving events from event table", e);
         } finally {
             cleanUpConnections(stmt, con);
         }
         return returnEventChunk.getFirst();
     }
 
-    public boolean checkExistence(Object[] obj) {
+    public boolean checkExistence(Object[] obj, ExecutionInfo executionInfo) {
 
         PreparedStatement stmt = null;
         Connection con = null;
@@ -283,7 +265,7 @@ public class DBConfiguration {
             }
 
         } catch (SQLException e) {
-            log.error("Error while retrieving events from event table", e);
+            throw new ExecutionPlanRuntimeException("Error while retrieving events from event table", e);
         } finally {
             cleanUpConnections(stmt, con);
         }
@@ -308,11 +290,11 @@ public class DBConfiguration {
         }
 
         try {
-            if (!tableExists) {
+            if (!tableExists && stmt != null) {
                 stmt.executeUpdate(executionInfo.getPreparedCreateTableStatement());
             }
         } catch (SQLException e) {
-            log.error(e);
+            throw new ExecutionPlanRuntimeException("Exception while creating the event table", e);
         } finally {
             cleanUpConnections(stmt, con);
         }
@@ -352,12 +334,12 @@ public class DBConfiguration {
                             break;
                     }
                 } else {
-                    log.error("Cannot Execute Insert/Update. Null value detected for " +
+                    throw new ExecutionPlanRuntimeException("Cannot Execute Insert/Update. Null value detected for " +
                             "attribute" + attribute.getName());
                 }
             }
         } catch (SQLException e) {
-            log.error("Cannot set value to attribute name " + attribute.getName() + ". " +
+            throw new ExecutionPlanRuntimeException("Cannot set value to attribute name " + attribute.getName() + ". " +
                     "Hence dropping the event." + e.getMessage(), e);
         }
     }
@@ -366,7 +348,7 @@ public class DBConfiguration {
     /**
      * Construct all the queries and assign to executionInfo instance
      */
-    private void initializeDatabaseExecutionInfo() {
+    private void initializeDatabaseExecutionInfo(ExecutionInfo executionInfo) {
 
         String databaseType;
         Connection con = null;
@@ -439,7 +421,7 @@ public class DBConfiguration {
             executionInfo.setPreparedTableExistenceCheckStatement(isTableExistQuery);
 
         } catch (SQLException e) {
-            log.error("Error while accessing through datasource connection", e);
+            throw new ExecutionPlanRuntimeException("Error while accessing through datasource connection", e);
         } finally {
             cleanUpConnections(null, con);
         }
@@ -486,7 +468,7 @@ public class DBConfiguration {
             try {
                 stmt.close();
             } catch (SQLException e) {
-                log.error("unable to release statement", e);
+                throw new ExecutionPlanRuntimeException("unable to release statement", e);
             }
         }
 
@@ -494,7 +476,7 @@ public class DBConfiguration {
             try {
                 con.close();
             } catch (SQLException e) {
-                log.error("unable to release connection", e);
+                throw new ExecutionPlanRuntimeException("unable to release connection", e);
             }
         }
     }
@@ -502,7 +484,7 @@ public class DBConfiguration {
 
     //Bloom Filter Operations  -----------------------------------------------------------------------------------------
 
-    public synchronized void buildBloomFilters() {
+    public void buildBloomFilters() {
         this.bloomFilters = new CountingBloomFilter[tableDefinition.getAttributeList().size()];
         this.isBloomFilterEnabled = true;
         for (int i = 0; i < bloomFilters.length; i++) {
@@ -543,13 +525,13 @@ public class DBConfiguration {
             results.close();
 
         } catch (SQLException ex) {
-            log.error("Error while initiating blooms filter with db data", ex);
+            throw new ExecutionPlanRuntimeException("Error while initiating blooms filter with db data", ex);
         } finally {
             cleanUpConnections(stmt, con);
         }
     }
 
-    public synchronized void addToBloomFilters(List<StreamEvent> eventList) {
+    public void addToBloomFilters(List<StreamEvent> eventList) {
         for (StreamEvent event : eventList) {
             for (int i = 0; i < attributeList.size(); i++) {
                 bloomFilters[i].add(new Key(event.getOutputData()[i].toString().getBytes()));
@@ -557,11 +539,9 @@ public class DBConfiguration {
         }
     }
 
-    public synchronized void removeFromBloomFilters(List<StreamEvent> eventList) {
-        for (StreamEvent event : eventList) {
-            for (int i = 0; i < attributeList.size(); i++) {
-                bloomFilters[i].delete(new Key(event.getOutputData()[i].toString().getBytes()));
-            }
+    public void removeFromBloomFilters(StreamEvent event) {
+        for (int i = 0; i < attributeList.size(); i++) {
+            bloomFilters[i].delete(new Key(event.getOutputData()[i].toString().getBytes()));
         }
     }
 
